@@ -33,7 +33,9 @@ Task pipeline:
   temporary Parquet files in /tmp and passed by path.
 
 DB connection:
-  Airflow Connection ID: PG_JOBBANK_CONN (type: postgres)
+  PG_JOBBANK_CONN is stored as an Airflow Variable containing a PostgreSQL
+  connection URI (postgresql://user:pass@host:port/db).
+  It is read via Variable.get() and passed directly to psycopg2.
 """
 
 from __future__ import annotations
@@ -43,10 +45,11 @@ import logging
 import os
 from datetime import datetime, date, timedelta
 
+import psycopg2
 import requests
 import pandas as pd
 from airflow.decorators import dag, task
-from airflow.providers.postgres.hooks.postgres import PostgresHook
+from airflow.models import Variable
 
 log = logging.getLogger(__name__)
 
@@ -58,7 +61,8 @@ CKAN_PACKAGE_URL = (
     "?id=ea639e28-c0fc-48bf-b5dd-b8899bd43072"
 )
 
-PG_CONN_ID   = "PG_JOBBANK_CONN"
+# PG_JOBBANK_CONN is an Airflow Variable containing a PostgreSQL URI
+PG_CONN_VAR  = "PG_JOBBANK_CONN"
 TARGET_TABLE = "jobbank_vacancies"
 
 # Mapping of CSV column names → target table columns.
@@ -216,8 +220,9 @@ def upsert(clean_path: str) -> int:
     """
     df = pd.read_parquet(clean_path)
 
-    hook = PostgresHook(postgres_conn_id=PG_CONN_ID)
-    conn = hook.get_conn()
+    # Read the connection URI from Airflow Variables and connect directly via psycopg2
+    conn_uri = Variable.get(PG_CONN_VAR)
+    conn = psycopg2.connect(conn_uri)
     cur  = conn.cursor()
 
     columns = [
