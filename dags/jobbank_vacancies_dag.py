@@ -171,6 +171,8 @@ def process_and_load(url: str, source_month: str) -> int:
     for col in ("salary_minimum", "salary_maximum"):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+            # NUMERIC(10,2) max is 99_999_999.99 — null out garbage values
+            df.loc[df[col].abs() >= 1e8, col] = None
 
     if "vacancy_count" in df.columns:
         df["vacancy_count"] = pd.to_numeric(df["vacancy_count"], errors="coerce")
