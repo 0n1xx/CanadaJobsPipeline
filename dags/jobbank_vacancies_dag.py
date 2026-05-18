@@ -26,11 +26,11 @@ Data source:
   first to get the current download link.
 
 Task pipeline:
-  get_source_month → get_csv_url → download_csv → clean → upsert
+  get_source_month → get_csv_url → process_and_load
 
-  Strings (source_month, url, file paths) travel between tasks via XCom.
-  DataFrames are too large for XCom (~30 MB), so they are saved as
-  temporary Parquet files in /tmp and passed by path.
+  Strings (source_month, url) travel between tasks via XCom.
+  download + clean + upsert are merged into one task because each Airflow
+  task runs in an isolated process — /tmp is not shared between tasks.
 
 DB connection:
   PG_JOBBANK_CONN is stored as an Airflow Variable containing a PostgreSQL
@@ -42,7 +42,6 @@ from __future__ import annotations
 
 import io
 import logging
-import os
 from datetime import datetime, date, timedelta
 
 import psycopg2
@@ -126,19 +125,20 @@ def get_csv_url(source_month: str) -> str:
 
 
 @task
-def download_csv(url: str, source_month: str) -> str:
+def process_and_load(url: str, source_month: str) -> int:
     """
-    Download the CSV file and save it as a Parquet file in /tmp.
-    Returns the path to the raw Parquet file.
+    Download the CSV, clean it, and upsert into PostgreSQL — all in one task.
 
-    File format quirks:
-    - Encoding: UTF-16LE (despite the .csv extension)
-    - Delimiter: tab
-    - Size: ~30-40 MB
-    - All values read as strings (dtype=str) to preserve leading zeros in NOC codes
+    Keeping these three steps in a single task avoids the /tmp sharing problem:
+    each Airflow task runs in an isolated process, so files written to /tmp
+    by one task are not visible to the next.
 
-    DataFrames are too large to pass via XCom, so we use /tmp as a staging area.
+    Steps:
+    1. Download — UTF-16LE tab-separated CSV, ~30-40 MB
+    2. Clean    — filter columns, cast types, replace "NA" with NULL
+    3. Upsert   — ON CONFLICT DO UPDATE, batches of 5000 rows
     """
+    # ── 1. Download ──────────────────────────────────────────────────────────
     log.info("Downloading: %s", url)
     resp = requests.get(url, timeout=300, stream=True)
     resp.raise_for_status()
@@ -147,31 +147,12 @@ def download_csv(url: str, source_month: str) -> str:
         io.BytesIO(resp.content),
         sep="\t",
         encoding="utf-16-le",
-        dtype=str,
+        dtype=str,       # keep everything as str to preserve NOC code leading zeros
         low_memory=False,
     )
     log.info("Downloaded %d rows, %d columns", len(df), len(df.columns))
 
-    path = f"/tmp/jobbank_{source_month}_raw.parquet"
-    df.to_parquet(path, index=False)
-    log.info("Saved raw data to %s", path)
-    return path
-
-
-@task
-def clean(raw_path: str, source_month: str) -> str:
-    """
-    Load the raw Parquet, select and rename columns, cast types, save cleaned Parquet.
-    Returns the path to the cleaned Parquet file.
-
-    Cleaning rules:
-    - String "NA" → NULL  (used in the source file for missing values)
-    - Dates in "YYYY/MM/DD" format → Python date
-    - salary_minimum / salary_maximum / vacancy_count / wic_id → numeric
-    """
-    df = pd.read_parquet(raw_path)
-
-    # Only keep columns that are both in COLUMN_MAP and present in the file
+    # ── 2. Clean ─────────────────────────────────────────────────────────────
     available = [c for c in COLUMN_MAP if c in df.columns]
     df = df[available].rename(columns=COLUMN_MAP).copy()
 
@@ -199,32 +180,9 @@ def clean(raw_path: str, source_month: str) -> str:
             df["wic_job_location_snapshot_id"], errors="coerce"
         )
 
-    path = f"/tmp/jobbank_{source_month}_clean.parquet"
-    df.to_parquet(path, index=False)
-    log.info("Saved cleaned data to %s (%d rows)", path, len(df))
+    log.info("Cleaned data: %d rows ready for upsert", len(df))
 
-    # Remove the raw file to free up disk space
-    os.remove(raw_path)
-    return path
-
-
-@task
-def upsert(clean_path: str) -> int:
-    """
-    Batch-upsert the cleaned Parquet file into the target table.
-    Returns the number of rows loaded.
-
-    Uses ON CONFLICT DO UPDATE so re-running the DAG for the same month
-    updates existing rows instead of creating duplicates.
-    Rows are inserted in batches of 5000 to keep memory usage predictable.
-    """
-    df = pd.read_parquet(clean_path)
-
-    # Read the connection URI from Airflow Variables and connect directly via psycopg2
-    conn_uri = Variable.get(PG_CONN_VAR)
-    conn = psycopg2.connect(conn_uri)
-    cur  = conn.cursor()
-
+    # ── 3. Upsert ─────────────────────────────────────────────────────────────
     columns = [
         "wic_job_location_snapshot_id", "job_title", "noc21_code", "noc21_code_name",
         "first_posting_date", "vacancy_count", "province_territory", "city",
@@ -251,6 +209,11 @@ def upsert(clean_path: str) -> int:
         for row in df[columns].itertuples(index=False, name=None)
     ]
 
+    # Read the connection URI from Airflow Variables and connect via psycopg2
+    conn_uri = Variable.get(PG_CONN_VAR)
+    conn = psycopg2.connect(conn_uri)
+    cur  = conn.cursor()
+
     BATCH = 5000
     for i in range(0, len(rows), BATCH):
         cur.executemany(sql, rows[i : i + BATCH])
@@ -260,8 +223,6 @@ def upsert(clean_path: str) -> int:
     cur.close()
     conn.close()
 
-    # Remove the cleaned file after successful load
-    os.remove(clean_path)
     log.info("Done — %d rows loaded", len(rows))
     return len(rows)
 
@@ -285,9 +246,7 @@ def upsert(clean_path: str) -> int:
 def jobbank_vacancies():
     source_month = get_source_month()
     url          = get_csv_url(source_month)
-    raw_path     = download_csv(url, source_month)
-    clean_path   = clean(raw_path, source_month)
-    upsert(clean_path)
+    process_and_load(url, source_month)
 
 
 jobbank_vacancies()
