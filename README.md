@@ -61,13 +61,20 @@ CanadaJobsPipeline/
 ### Задачи
 
 ```
-create_table  ──►  fetch_and_load
+get_source_month → get_csv_url → download_csv → clean → upsert
 ```
 
 | Task | Описание |
 |---|---|
-| `create_table` | Выполняет DDL-скрипт (`CREATE TABLE IF NOT EXISTS` + индексы). Идемпотентно. |
-| `fetch_and_load` | Запрашивает CKAN API → скачивает CSV → парсит → делает upsert в PostgreSQL |
+| `get_source_month` | Определяет целевой месяц из `data_interval_start` → возвращает строку вида `jan2026` |
+| `get_csv_url` | Запрашивает CKAN API и возвращает актуальный URL CSV-файла для нужного месяца |
+| `download_csv` | Скачивает CSV (~30-40 MB, UTF-16LE), сохраняет как Parquet в `/tmp` |
+| `clean` | Фильтрует колонки, приводит типы, заменяет `NA` → `NULL`, сохраняет очищенный Parquet |
+| `upsert` | Загружает очищенный Parquet в PostgreSQL батчами по 5000 строк |
+
+Строки (`source_month`, `url`, пути к файлам) передаются между тасками через XCom.
+DataFrame-ы слишком велики для XCom, поэтому хранятся во временных Parquet-файлах в `/tmp`
+и удаляются после каждого шага.
 
 ### Upsert-логика
 
