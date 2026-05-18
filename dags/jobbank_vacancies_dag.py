@@ -25,6 +25,13 @@ Data source:
   The resource URL changes every month, so the DAG queries the CKAN API
   first to get the current download link.
 
+Task pipeline:
+  get_source_month → get_csv_url → download_csv → clean → upsert
+
+  Strings (source_month, url, file paths) travel between tasks via XCom.
+  DataFrames are too large for XCom (~30 MB), so they are saved as
+  temporary Parquet files in /tmp and passed by path.
+
 DB connection:
   Airflow Connection ID: PG_JOBBANK_CONN (type: postgres)
 """
@@ -38,8 +45,7 @@ from datetime import datetime, date, timedelta
 
 import requests
 import pandas as pd
-from airflow import DAG
-from airflow.operators.python import PythonOperator
+from airflow.decorators import dag, task
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 log = logging.getLogger(__name__)
@@ -74,28 +80,27 @@ COLUMN_MAP = {
     "Salary Maximum":               "salary_maximum",
 }
 
-# DDL file is located next to this file in the sql/ folder
-SQL_CREATE = os.path.join(
-    os.path.dirname(__file__), "..", "sql", "create_jobbank_vacancies.sql"
-)
+# ─── Tasks ────────────────────────────────────────────────────────────────────
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
-
-def _source_month(execution_date: date) -> str:
+@task
+def get_source_month(data_interval_start=None) -> str:
     """
-    Convert the interval start date to a month string like 'jan2026', 'feb2026', etc.
-    This string is used as the source_month key in the table and as the
-    filename suffix on open.canada.ca.
+    Derive the target month string from the interval start date.
+    For a run on Feb 1, data_interval_start is Jan 1 → returns 'jan2026'.
     """
-    return execution_date.strftime("%b%Y").lower()
+    execution_date: date = data_interval_start.date()
+    source_month = execution_date.strftime("%b%Y").lower()
+    log.info("source_month=%s", source_month)
+    return source_month
 
 
-def _get_csv_url(source_month: str) -> str:
+@task
+def get_csv_url(source_month: str) -> str:
     """
-    Query the CKAN API and return the download URL of the English CSV for the given month.
+    Query the CKAN API and return the download URL for the given month.
 
-    The resource URL changes every month (different resource_id), so we can't
-    hardcode it — we need to look it up via the API each time.
+    The resource URL changes every month (different resource_id), so we
+    look it up dynamically instead of hardcoding it.
     """
     resp = requests.get(CKAN_PACKAGE_URL, timeout=30)
     resp.raise_for_status()
@@ -106,25 +111,29 @@ def _get_csv_url(source_month: str) -> str:
     for resource in resources:
         url: str = resource.get("url", "")
         if url.endswith(filename):
-            log.info("Found resource URL for %s: %s", source_month, url)
+            log.info("Found URL: %s", url)
             return url
 
     raise ValueError(
         f"No resource found for month '{source_month}'. "
         f"The file may not be published yet (usually available ~7 days after month end). "
-        f"Available files: {[r.get('url','').split('/')[-1] for r in resources]}"
+        f"Available files: {[r.get('url', '').split('/')[-1] for r in resources]}"
     )
 
 
-def _download_csv(url: str) -> pd.DataFrame:
+@task
+def download_csv(url: str, source_month: str) -> str:
     """
-    Download the CSV file and return a DataFrame.
+    Download the CSV file and save it as a Parquet file in /tmp.
+    Returns the path to the raw Parquet file.
 
     File format quirks:
     - Encoding: UTF-16LE (despite the .csv extension)
     - Delimiter: tab
     - Size: ~30-40 MB
     - All values read as strings (dtype=str) to preserve leading zeros in NOC codes
+
+    DataFrames are too large to pass via XCom, so we use /tmp as a staging area.
     """
     log.info("Downloading: %s", url)
     resp = requests.get(url, timeout=300, stream=True)
@@ -138,18 +147,26 @@ def _download_csv(url: str) -> pd.DataFrame:
         low_memory=False,
     )
     log.info("Downloaded %d rows, %d columns", len(df), len(df.columns))
-    return df
+
+    path = f"/tmp/jobbank_{source_month}_raw.parquet"
+    df.to_parquet(path, index=False)
+    log.info("Saved raw data to %s", path)
+    return path
 
 
-def _clean(df: pd.DataFrame, source_month: str) -> pd.DataFrame:
+@task
+def clean(raw_path: str, source_month: str) -> str:
     """
-    Keep only the required columns, rename them, and cast to the correct types.
+    Load the raw Parquet, select and rename columns, cast types, save cleaned Parquet.
+    Returns the path to the cleaned Parquet file.
 
     Cleaning rules:
     - String "NA" → NULL  (used in the source file for missing values)
     - Dates in "YYYY/MM/DD" format → Python date
     - salary_minimum / salary_maximum / vacancy_count / wic_id → numeric
     """
+    df = pd.read_parquet(raw_path)
+
     # Only keep columns that are both in COLUMN_MAP and present in the file
     available = [c for c in COLUMN_MAP if c in df.columns]
     df = df[available].rename(columns=COLUMN_MAP).copy()
@@ -178,17 +195,27 @@ def _clean(df: pd.DataFrame, source_month: str) -> pd.DataFrame:
             df["wic_job_location_snapshot_id"], errors="coerce"
         )
 
-    return df
+    path = f"/tmp/jobbank_{source_month}_clean.parquet"
+    df.to_parquet(path, index=False)
+    log.info("Saved cleaned data to %s (%d rows)", path, len(df))
+
+    # Remove the raw file to free up disk space
+    os.remove(raw_path)
+    return path
 
 
-def _upsert(df: pd.DataFrame) -> None:
+@task
+def upsert(clean_path: str) -> int:
     """
-    Batch-upsert the DataFrame into the target table.
+    Batch-upsert the cleaned Parquet file into the target table.
+    Returns the number of rows loaded.
 
     Uses ON CONFLICT DO UPDATE so re-running the DAG for the same month
     updates existing rows instead of creating duplicates.
     Rows are inserted in batches of 5000 to keep memory usage predictable.
     """
+    df = pd.read_parquet(clean_path)
+
     hook = PostgresHook(postgres_conn_id=PG_CONN_ID)
     conn = hook.get_conn()
     cur  = conn.cursor()
@@ -227,43 +254,16 @@ def _upsert(df: pd.DataFrame) -> None:
     conn.commit()
     cur.close()
     conn.close()
+
+    # Remove the cleaned file after successful load
+    os.remove(clean_path)
     log.info("Done — %d rows loaded", len(rows))
-
-
-# ─── Task functions ───────────────────────────────────────────────────────────
-
-def create_table(**context) -> None:
-    """
-    Create the table and indexes if they don't exist yet (idempotent).
-    DDL is read from sql/create_jobbank_vacancies.sql.
-    """
-    hook = PostgresHook(postgres_conn_id=PG_CONN_ID)
-    with open(SQL_CREATE) as f:
-        ddl = f.read()
-    hook.run(ddl)
-    log.info("Table %s is ready", TARGET_TABLE)
-
-
-def fetch_and_load(**context) -> None:
-    """
-    Main task: download the CSV for the target month and upsert into the DB.
-
-    data_interval_start is the beginning of the period we're collecting data for.
-    For a run on Feb 1 this is Jan 1, so source_month becomes 'jan2026'.
-    """
-    execution_date: date = context["data_interval_start"].date()
-    source_month = _source_month(execution_date)
-    log.info("Processing source_month=%s", source_month)
-
-    url = _get_csv_url(source_month)
-    df  = _download_csv(url)
-    df  = _clean(df, source_month)
-    _upsert(df)
+    return len(rows)
 
 
 # ─── DAG definition ───────────────────────────────────────────────────────────
 
-with DAG(
+@dag(
     dag_id="jobbank_vacancies",
     description="Monthly ingestion of Job Bank Canada vacancies into PostgreSQL",
     start_date=datetime(2026, 1, 1),     # backfill starts from January 2026
@@ -276,19 +276,13 @@ with DAG(
         "owner": "data-team",
     },
     tags=["jobbank", "canada", "vacancies"],
-) as dag:
+)
+def jobbank_vacancies():
+    source_month = get_source_month()
+    url          = get_csv_url(source_month)
+    raw_path     = download_csv(url, source_month)
+    clean_path   = clean(raw_path, source_month)
+    upsert(clean_path)
 
-    t_create = PythonOperator(
-        task_id="create_table",
-        python_callable=create_table,
-        doc_md="Creates the `jobbank_vacancies` table and indexes (IF NOT EXISTS).",
-    )
 
-    t_load = PythonOperator(
-        task_id="fetch_and_load",
-        python_callable=fetch_and_load,
-        doc_md="Downloads the monthly CSV from open.canada.ca and upserts into PostgreSQL.",
-    )
-
-    # create_table always runs first to guarantee the table exists before loading
-    t_create >> t_load
+jobbank_vacancies()
