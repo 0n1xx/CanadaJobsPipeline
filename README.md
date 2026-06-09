@@ -27,7 +27,7 @@ open.canada.ca  →  Airflow DAG  →  PostgreSQL  →  Tableau Public
 
 Interactive dashboard built on pipeline data — **423K+ vacancies** across Canada.
 
-![Jobs Canada Dashboard](docs/dashboard-preview.png)
+![Jobs Canada Dashboard](docs/dashboard_screenshot.png)
 
 ### Dashboard layout
 
