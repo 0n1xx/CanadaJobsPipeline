@@ -191,9 +191,3 @@ airflow dags backfill jobbank_vacancies \
 ## Author
 
 **Vladislav Sakharov**
-
----
-
-## License
-
-MIT — see [LICENSE](LICENSE)
