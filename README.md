@@ -1,163 +1,203 @@
 # CanadaJobsPipeline
 
-ETL-пайплайн для анализа канадского рынка труда на основе открытых данных Job Bank, Apache Airflow, PostgreSQL и Tableau.
+End-to-end analytics project on the Canadian labour market: **Job Bank open data → Apache Airflow DAG → PostgreSQL → interactive Tableau Public dashboard**.
+
+**Repository:** https://github.com/vladsakharov/CanadaJobsPipeline  
+**Dashboard:** https://public.tableau.com/app/profile/YOUR_PROFILE/viz/JobsCanada/JobsCanada *(replace with your published link)*
 
 ---
 
-## Архитектура
+## Architecture
 
 ```
-open.canada.ca  ──►  Airflow DAG  ──►  PostgreSQL  ──►  Tableau
-(CSV, monthly)        (parse +          (jobbank_
-                       upsert)           vacancies)
+open.canada.ca  →  Airflow DAG  →  PostgreSQL  →  Tableau Public
+(Job Bank CSV)      (CKAN + ETL)    (jobbank_vacancies)   Jobs Canada Dashboard
 ```
 
----
-
-## Источник данных
-
-**Job Bank Canada — Open Data**
-[open.canada.ca/data/en/dataset/ea639e28...](https://open.canada.ca/data/en/dataset/ea639e28-c0fc-48bf-b5dd-b8899bd43072)
-
-- Ежемесячные снимки всех вакансий, размещённых на jobbank.gc.ca
-- Формат: UTF-16LE, tab-separated CSV (~30-40 MB/месяц)
-- Данные появляются примерно через 7 дней после окончания месяца
-- URL файла каждый месяц меняется → DAG запрашивает актуальную ссылку через CKAN API
+| Layer | Description |
+|-------|-------------|
+| **Source** | [Job Bank Canada Open Data](https://open.canada.ca/data/en/dataset/ea639e28-c0fc-48bf-b5dd-b8899bd43072) — monthly vacancy snapshots |
+| **Orchestration** | Airflow DAG `jobbank_vacancies` — download, clean, upsert |
+| **Storage** | PostgreSQL table `jobbank_vacancies` |
+| **Analytics** | Tableau — KPIs, trends, map, Job Bank drill-down |
 
 ---
 
-## Структура проекта
+## Dashboard: Jobs Canada (Jan–May 2026)
+
+Interactive dashboard built on pipeline data — **423K+ vacancies** across Canada.
+
+![Jobs Canada Dashboard](docs/dashboard-preview.png)
+
+### Dashboard layout
+
+| Section | What it shows |
+|---------|---------------|
+| **KPI cards + sparklines** | Total vacancies, latest month + MoM, median pay, on-site % |
+| **Monthly Trend** | Vacancies by month + MoM % line (dual axis) |
+| **Top 20 NOC** | Most in-demand occupations (NOC 2021) |
+| **Map + Web** | Vacancies by province, click → Wikipedia |
+| **Detail Table** | Province, city, NOC, salary, pagination, link to Job Bank |
+| **Filters** | Province, NOC, Posting Month (applied to all worksheets) |
+
+### Tableau techniques used
+
+- Calculated fields — salary normalization, smart K/M labels, URL fields
+- LOD expressions (`FIXED`) — filter-responsive latest-month KPI
+- Table calculations — MoM (`LOOKUP`), pagination (`INDEX`)
+- Parameters — `Page Number`
+- Dual axis — bars + MoM line on Monthly Trend
+- Dashboard URL actions — map → Wiki, table → Job Bank, reset → Canada
+
+### Connect data in Tableau
+
+```sql
+SELECT * FROM jobbank_vacancies ORDER BY source_month, province_territory;
+```
+
+Export to CSV → **Tableau → Connect → Text file**.
+
+---
+
+## Project structure
 
 ```
 CanadaJobsPipeline/
 ├── dags/
-│   └── jobbank_vacancies_dag.py      # Airflow DAG
+│   └── jobbank_vacancies_dag.py
 ├── sql/
-│   └── create_jobbank_vacancies.sql  # DDL таблицы и индексов
+│   └── create_jobbank_vacancies.sql
+├── docs/
+│   └── dashboard-preview.png
 ├── requirements.txt
 └── README.md
 ```
 
 ---
 
-## DAG: `jobbank_vacancies`
+## Data source
 
-### Расписание
+**Job Bank Canada — Open Data**  
+https://open.canada.ca/data/en/dataset/ea639e28-c0fc-48bf-b5dd-b8899bd43072
 
-| Параметр | Значение |
-|---|---|
-| Cron | `0 8 1 * *` |
-| Когда запускается | 1-е число каждого месяца в 08:00 UTC |
-| Какой месяц обрабатывает | **Предыдущий** (запуск 1 февраля → данные за январь) |
-| Бэкфилл с | 2026-01-01 |
-| `catchup` | `True` — Airflow сам создаёт пропущенные запуски |
-| `max_active_runs` | 3 — до 3 месяцев параллельно при бэкфилле |
-
-> **Почему предыдущий месяц?**
-> В Airflow `data_interval_start` всегда равен началу прошедшего интервала.
-> Запуск на 1 февраля имеет `data_interval_start = 1 января` → DAG скачивает `jan2026`.
-> Данные за текущий месяц ещё неполные, поэтому такая логика правильна.
-
-### Задачи
-
-```
-get_source_month → get_csv_url → download_csv → clean → upsert
-```
-
-| Task | Описание |
-|---|---|
-| `get_source_month` | Определяет целевой месяц из `data_interval_start` → возвращает строку вида `jan2026` |
-| `get_csv_url` | Запрашивает CKAN API и возвращает актуальный URL CSV-файла для нужного месяца |
-| `download_csv` | Скачивает CSV (~30-40 MB, UTF-16LE), сохраняет как Parquet в `/tmp` |
-| `clean` | Фильтрует колонки, приводит типы, заменяет `NA` → `NULL`, сохраняет очищенный Parquet |
-| `upsert` | Загружает очищенный Parquet в PostgreSQL батчами по 5000 строк |
-
-Строки (`source_month`, `url`, пути к файлам) передаются между тасками через XCom.
-DataFrame-ы слишком велики для XCom, поэтому хранятся во временных Parquet-файлах в `/tmp`
-и удаляются после каждого шага.
-
-### Upsert-логика
-
-Конфликт определяется по `UNIQUE(wic_job_location_snapshot_id, source_month)`.
-При повторном запуске за тот же месяц данные обновляются, дублей не возникает.
+- Monthly snapshots of all vacancies posted on jobbank.gc.ca
+- Format: UTF-16LE, tab-separated CSV (~30–40 MB per month)
+- File URL changes every month → DAG resolves the current link via CKAN API
+- New month data is usually published ~7 days after month end
 
 ---
 
-## База данных
+## DAG: `jobbank_vacancies`
 
-### Таблица `jobbank_vacancies`
+### Schedule
 
-| Колонка | Тип | Описание |
-|---|---|---|
-| `wic_job_location_snapshot_id` | BIGINT | Уникальный ID снимка из Job Bank |
-| `job_title` | VARCHAR(255) | Название вакансии |
-| `noc21_code` | VARCHAR(10) | Код NOC 2021 |
-| `noc21_code_name` | VARCHAR(255) | Название профессии по NOC 2021 |
-| `first_posting_date` | DATE | Дата первой публикации вакансии |
-| `vacancy_count` | SMALLINT | Количество вакансий |
-| `province_territory` | VARCHAR(100) | Провинция / территория |
-| `city` | VARCHAR(100) | Город |
+| Setting | Value |
+|---------|-------|
+| Cron | `0 8 1 * *` |
+| Runs | 1st of every month at 08:00 UTC |
+| Processes | **Previous** month (run on Feb 1 → loads `jan2026`) |
+| `start_date` | 2026-01-01 |
+| `catchup` | `True` |
+| `max_active_runs` | 3 |
+
+> Airflow `data_interval_start` points to the start of the completed interval, so the DAG always loads the previous month — not the current one.
+
+### Task pipeline
+
+```
+get_source_month → get_csv_url → process_and_load
+```
+
+| Task | Description |
+|------|-------------|
+| `get_source_month` | Derives target month from `data_interval_start` → `jan2026` |
+| `get_csv_url` | CKAN API → current CSV download URL |
+| `process_and_load` | Download + clean + upsert to PostgreSQL (batches of 5,000) |
+
+Strings (`source_month`, `url`) pass between tasks via XCom.  
+Download, clean, and upsert are merged into one task because Airflow tasks run in isolated processes — `/tmp` is not shared across tasks.
+
+### Upsert logic
+
+Conflict key: `UNIQUE(wic_job_location_snapshot_id, source_month)` → `ON CONFLICT DO UPDATE`.  
+Re-running the same month updates rows without duplicates.
+
+---
+
+## Database
+
+Table `jobbank_vacancies` — DDL in `sql/create_jobbank_vacancies.sql`.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `wic_job_location_snapshot_id` | BIGINT | Job Bank snapshot ID |
+| `job_title` | VARCHAR(255) | Job title |
+| `noc21_code` | VARCHAR(10) | NOC 2021 code |
+| `noc21_code_name` | VARCHAR(255) | Occupation name |
+| `first_posting_date` | DATE | First posting date |
+| `vacancy_count` | SMALLINT | Number of vacancies |
+| `province_territory` | VARCHAR(100) | Province / territory |
+| `city` | VARCHAR(100) | City |
 | `employment_type` | VARCHAR(50) | Full time / Part time |
 | `employment_term` | VARCHAR(100) | Permanent / Temporary |
 | `employment_term_telework` | VARCHAR(10) | Yes / No |
 | `salary_per` | VARCHAR(20) | Hour / Week / Month / Year |
-| `salary_minimum` | NUMERIC(10,2) | Минимальная зарплата |
-| `salary_maximum` | NUMERIC(10,2) | Максимальная зарплата |
-| `source_month` | VARCHAR(20) | Метка месяца: jan2026, feb2026, … |
-| `created_at` | TIMESTAMP | Время загрузки записи |
+| `salary_minimum` | NUMERIC(10,2) | Min salary |
+| `salary_maximum` | NUMERIC(10,2) | Max salary |
+| `source_month` | VARCHAR(20) | jan2026, feb2026, … |
+| `created_at` | TIMESTAMP | Load timestamp |
+
+Source CSV has 65 columns — 14 are loaded into the database.
 
 ---
 
-## Настройка
+## Setup
 
-### 1. Зависимости
+### 1. Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-`requirements.txt` должен содержать:
-```
-apache-airflow
-apache-airflow-providers-postgres
-pandas
-requests
-```
+### 2. Airflow Variable
 
-### 2. Airflow Connection
-
-Создайте подключение с ID **`PG_JOBBANK_CONN`** (тип: `postgres`):
+Create **`PG_JOBBANK_CONN`** with a PostgreSQL URI:
 
 ```bash
-airflow connections add PG_JOBBANK_CONN \
-  --conn-type postgres \
-  --conn-host <host> \
-  --conn-login <user> \
-  --conn-password <password> \
-  --conn-schema <database> \
-  --conn-port 5432
+airflow variables set PG_JOBBANK_CONN "postgresql://user:pass@host:5432/db"
 ```
 
-Или через Airflow UI: **Admin → Connections → +**.
+Or via Airflow UI: **Admin → Variables → +**.
 
-### 3. Бэкфилл истории
+### 3. Create the table
 
-При первом включении DAG (`catchup=True`) Airflow автоматически создаст все
-запуски начиная с `start_date=2026-01-01`. Их выполнение можно ускорить,
-увеличив `max_active_runs` на время бэкфилла.
+```bash
+psql -h <host> -U <user> -d <db> -f sql/create_jobbank_vacancies.sql
+```
 
-Ручной запуск конкретного диапазона:
+### 4. Backfill
+
 ```bash
 airflow dags backfill jobbank_vacancies \
   --start-date 2026-01-01 \
-  --end-date   2026-04-01
+  --end-date   2026-05-01
 ```
 
 ---
 
-## Примечания
+## Notes
 
-- Данные за текущий месяц появляются на open.canada.ca примерно **через 7 дней после его окончания**.
-  Если DAG запустится до публикации файла — задача упадёт с ошибкой и повторит попытку (retry × 2, каждые 10 мин).
-- Поле `city` и зарплатные поля часто содержат `NULL` — это норма для данного датасета.
-- Исходный CSV содержит 65 колонок; в базу загружаются только 14 нужных.
+- If a monthly file is not published yet, the task fails and retries 2× (every 10 minutes).
+- `city` and salary fields are often `NULL` — expected for this dataset.
+
+---
+
+## Author
+
+**Vladislav Sakharov**
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE)
