@@ -157,10 +157,10 @@ pip install -r requirements.txt
 
 ### 2. Airflow Variable
 
-Create **`PG_JOBBANK_CONN`** with a PostgreSQL URI:
+Create **`PG_CONN`** with a PostgreSQL URI:
 
 ```bash
-airflow variables set PG_JOBBANK_CONN "postgresql://user:pass@host:5432/db"
+airflow variables set PG_CONN "postgresql://user:pass@host:5432/db"
 ```
 
 Or via Airflow UI: **Admin → Variables → +**.

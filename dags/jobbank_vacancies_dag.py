@@ -33,7 +33,7 @@ Task pipeline:
   task runs in an isolated process — /tmp is not shared between tasks.
 
 DB connection:
-  PG_JOBBANK_CONN is stored as an Airflow Variable containing a PostgreSQL
+  PG_CONN is stored as an Airflow Variable containing a PostgreSQL
   connection URI (postgresql://user:pass@host:port/db).
   It is read via Variable.get() and passed directly to psycopg2.
 """
@@ -60,8 +60,7 @@ CKAN_PACKAGE_URL = (
     "?id=ea639e28-c0fc-48bf-b5dd-b8899bd43072"
 )
 
-# PG_JOBBANK_CONN is an Airflow Variable containing a PostgreSQL URI
-PG_CONN_VAR  = "PG_JOBBANK_CONN"
+PG_CONN_VAR = "PG_CONN"
 TARGET_TABLE = "jobbank_vacancies"
 
 # Mapping of CSV column names → target table columns.
