@@ -3,7 +3,7 @@
 End-to-end analytics project on the Canadian labour market: **Job Bank open data → Apache Airflow DAG → PostgreSQL → interactive Tableau Public dashboard**.
 
 **Repository:** https://github.com/vladsakharov/CanadaJobsPipeline  
-**Dashboard:** https://public.tableau.com/app/profile/YOUR_PROFILE/viz/JobsCanada/JobsCanada **
+**Dashboard:** https://public.tableau.com/app/profile/YOUR_PROFILE/viz/JobsCanada/JobsCanada**
 
 ---
 
